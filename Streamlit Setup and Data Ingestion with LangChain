@@ -1,0 +1,79 @@
+import streamlit as st
+import os
+import base64
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from langchain.document_loaders import PDFMinerLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import SentenceTransformerEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from constants import CHROMA_SETTINGS
+from streamlit_chat import message
+
+st.set_page_config(layout="wide")
+
+checkpoint = "MBZUAI/LaMini-T5-738M"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+base_model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint, device_map="cpu", torch_dtype=torch.float32)
+
+@st.cache_resource
+def data_ingestion():
+    """Load and process documents to create embeddings."""
+    documents = []
+    for root, _, files in os.walk("docs"):
+        for file in files:
+            if file.endswith(".pdf"):
+                loader = PDFMinerLoader(os.path.join(root, file))
+                documents += loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=500)
+    texts = text_splitter.split_documents(documents)
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma.from_documents(texts, embeddings, persist_directory="db", client_settings=CHROMA_SETTINGS)
+    db.persist()
+    return db
+
+@st.cache_resource
+def create_llm_pipeline():
+    """Set up the language model pipeline."""
+    text_pipeline = pipeline('text2text-generation', model=base_model, tokenizer=tokenizer, max_length=256, do_sample=True, temperature=0.3, top_p=0.95, device="cpu")
+    return text_pipeline
+
+@st.cache_resource
+def setup_retrieval_qa():
+    """Set up the retrieval-based question-answering system."""
+    llm = create_llm_pipeline()
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma(persist_directory="db", embedding_function=embeddings, client_settings=CHROMA_SETTINGS)
+    retriever = db.as_retriever()
+    qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=True)
+    return qa_chain
+
+def display_pdf(file_path):
+    """Display PDF in Streamlit using an embedded HTML iframe."""
+    with open(file_path, "rb") as f:
+        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+def main():
+    st.title("Chat with your PDF 🦜📄")
+    uploaded_file = st.file_uploader("Upload your PDF", type=["pdf"])
+    if uploaded_file:
+        file_path = f"docs/{uploaded_file.name}"
+        with open(file_path, "wb") as temp_file:
+            temp_file.write(uploaded_file.read())
+        display_pdf(file_path)
+        
+        with st.spinner("Processing..."):
+            db = data_ingestion()
+        st.success("Data ingested successfully!")
+
+        user_input = st.text_input("Ask your PDF anything!")
+        qa = setup_retrieval_qa()
+        if user_input:
+            answer = qa({"query": user_input})
+            st.write(answer["result"])
+
+if __name__ == "__main__":
+    main()
